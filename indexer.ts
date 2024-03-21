@@ -15,7 +15,6 @@ import { Block } from "@near-lake/primitives";
 
 async function getBlock(block: Block) {
   const BASE_ACCOUNT_ID = "potlock.near"; // potlock base id to match all actions
-  
   // this function helps match factories, deployed in the manner `version.ptofactory....` where version can be v1,v2,vn
   function matchVersionPattern(text) {
     const pattern = /^v\d+\.potfactory\.potlock\.near$/;
@@ -390,17 +389,52 @@ async function getBlock(block: Block) {
 
   async function handlePayoutChallenge(args, receiverId, signerId, receiptId) {
     let data = JSON.parse(args);
-    console.log("set payout data::", { ...data }, receiverId);
+    console.log("challenging payout..: ", { ...data }, receiverId);
+    let created_at = new Date(
+      Number(BigInt(block.header().timestampNanosec) / BigInt(1000000)) // convert to ms then date
+    )
     let payoutChallenge = {
       challenger_id: signerId,
       pot_id: receiverId,
-      created_at: new Date(
-        Number(BigInt(block.header().timestampNanosec) / BigInt(1000000)) // convert to ms then date
-      ),
+      created_at,
       message: data.reason,
       tx_hash: receiptId,
     };
     await context.db.PotPayoutChallenge.insert(payoutChallenge);
+
+    let activity = {
+      signer_id: signerId,
+      receiver_id: receiverId,
+      timestamp: created_at,
+      type: "Challenge_Payout",
+      action_result: receiverId,
+      tx_hash: receiptId,
+    };
+
+    await context.db.Activity.insert(activity);
+  }
+
+  async function handleListAdminRemoval(args, receiverId, signerId, receiptId) {
+    let data = JSON.parse(args);
+    console.log("removing admin...: ", { ...data }, receiverId);
+    let ts = new Date(
+      Number(BigInt(block.header().timestampNanosec) / BigInt(1000000)) // convert to ms then date
+    )
+    let list = await context.db.List.select({id: receiverId})
+
+    for (const acct in data.admins) {
+      await context.db.ListAdmin.delete({ list_id: list[0].id, admin_id: acct})
+    }
+
+    let activity = {
+      signer_id: signerId,
+      receiver_id: receiverId,
+      timestamp: ts,
+      type: "Remove_List_Admin",
+      tx_hash: receiptId,
+    };
+
+    await context.db.Activity.insert(activity);
   }
 
   const GECKO_URL = "https://api.coingecko.com/api/v3";
@@ -412,6 +446,7 @@ async function getBlock(block: Block) {
     return `${day}-${month}-${year}`;
   }
 
+  // helper function to format
   function formatToNear(yoctoAmount) {
     const nearAmount = yoctoAmount / 10 ** 24;
     return nearAmount;
@@ -443,6 +478,11 @@ async function getBlock(block: Block) {
     let response = await fetch(endpoint);
     let data = await response.json();
     let unit_price = data.market_data?.current_price.usd;
+    if (!unit_price) {
+      console.log("api rate limi?::", data)
+      unit_price = parseFloat(localStorage.getItem("last_price"))
+    }
+    localStorage.setItem("last_price", unit_price.toString()) // store last price incase subsequent price fetch fails,  does it support local storage?
 
     let total_amount = donation_data.total_amount;
     let net_amount = (
@@ -453,9 +493,6 @@ async function getBlock(block: Block) {
     let netnearAMount = formatToNear(net_amount);
     let total_amount_usd = unit_price * totalnearAMount
     let net_amount_usd = unit_price * netnearAMount
-
-    console.log("feram..", unit_price, totalnearAMount, total_amount, net_amount, total_amount_usd, net_amount_usd)
-
     let donation = {
       donor_id: donation_data.donor_id,
       total_amount,
@@ -474,7 +511,7 @@ async function getBlock(block: Block) {
     };
     await context.db.Donation.insert(donation);
 
-    if (actionName != "donate") {
+    if (actionName != "donate") { // update pot data such as public donations and matchingpool
       let pot = (await context.db.Pot.select({ id: receiverId}))[0]
       donation["pot_id"] = pot.id
       let potUpdate = {
@@ -680,6 +717,18 @@ async function getBlock(block: Block) {
                 JSON.parse(args)
               );
               await handlePayout(
+                args,
+                action.receiverId,
+                action.signerId,
+                action.receiptId
+              );
+              break;
+            case "owner_remove_admins":
+              console.log(
+                "setting payot....:",
+                JSON.parse(args)
+              );
+              await handleListAdminRemoval(
                 args,
                 action.receiverId,
                 action.signerId,
