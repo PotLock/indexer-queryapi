@@ -58,6 +58,10 @@ async function getBlock(block: Block) {
     return;
   }
 
+  const created_at = new Date(
+    Number(BigInt(block.header().timestampNanosec) / BigInt(1000000))
+  );
+
   const functionCallTracked = [
     "CREATE_ACCOUNT",
     "deploy_pot",
@@ -97,22 +101,18 @@ async function getBlock(block: Block) {
       }
     }
 
-    const deploy_time = new Date(
-      Number(BigInt(block.header().timestampNanosec) / BigInt(1000000))
-    );
-
     const potObject = {
       id: receiverId,
       pot_factory_id: predecessorId,
       deployer_id: signerId,
-      deployed_at: deploy_time,
+      deployed_at: created_at,
       source_metadata: JSON.stringify(data.source_metadata),
       owner_id: data.owner,
       chef_id: data.chef,
       name: data.pot_name,
       description: data.pot_description,
       max_approved_applicants: data.max_projects,
-      base_currency: null,
+      base_currency: "near",
       application_start: new Date(data.application_start_ms),
       application_end: new Date(data.application_end_ms),
       matching_round_start: new Date(data.public_round_start_ms),
@@ -120,21 +120,21 @@ async function getBlock(block: Block) {
       registry_provider: data.registry_provider,
       min_matching_pool_donation_amount: data.min_matching_pool_donation_amount,
       sybil_wrapper_provider: data.sybil_wrapper_provider,
-      custom_sybil_checks: data.custom_sybil_checks,
+      custom_sybil_checks: data.custom_sybil_checks ? JSON.stringify(data.custom_sybil_checks) : null,
       custom_min_threshold_score: data.custom_min_threshold_score,
       referral_fee_matching_pool_basis_points:
         data.referral_fee_matching_pool_basis_points,
       referral_fee_public_round_basis_points:
         data.referral_fee_public_round_basis_points,
       chef_fee_basis_points: data.chef_fee_basis_points,
-      total_matching_pool: data.total_matching_pool || "0",
+      total_matching_pool: "0",
       total_matching_pool_usd: data.total_matching_pool_usd,
-      matching_pool_balance: data.matching_pool_balance || "0",
-      matching_pool_donations_count: data.matching_pool_donations_count || 0,
-      total_public_donations: data.total_public_donations || "0",
+      matching_pool_balance: "0",
+      matching_pool_donations_count: 0,
+      total_public_donations: "0",
       total_public_donations_usd: data.total_public_donations_usd,
-      public_donations_count: data.public_donations_count || 0,
-      cooldown_end: data.cooldown_end,
+      public_donations_count: 0,
+      cooldown_period_ms: null,
       all_paid_out: false,
       protocol_config_provider: data.protocol_config_provider,
     };
@@ -144,9 +144,9 @@ async function getBlock(block: Block) {
     let activity = {
       signer_id: signerId,
       receiver_id: receiverId,
-      timestamp: deploy_time,
+      timestamp: created_at,
       type: "Deploy_Pot",
-      action_result: potObject.id,
+      action_result: JSON.stringify(potObject),
       tx_hash: receiptId,
     };
 
@@ -184,14 +184,10 @@ async function getBlock(block: Block) {
         await context.db.PotFactoryWhitelistedDeployer.insert(factory_deployer);
       }
     }
-
-    const deploy_time = new Date(
-      Number(BigInt(block.header().timestampNanosec) / BigInt(1000000))
-    );
     const factory = {
       id: receiverId,
       owner_id: data.owner,
-      deployed_at: deploy_time,
+      deployed_at: created_at,
       source_metadata: JSON.stringify(data.source_metadata),
       protocol_fee_basis_points: data.protocol_fee_basis_points,
       protocol_fee_recipient_account: data.protocol_fee_recipient_account,
@@ -203,14 +199,17 @@ async function getBlock(block: Block) {
 
   // function tracks registry contracts, where projects are registered
   async function handleRegistry(args, receiverId, signerId, receiptId) {
-    let data = JSON.parse(args);
+    let receipt = block
+      .receipts()
+      .filter((receipt) => receipt.receiptId == receiptId)[0];
+    let data = JSON.parse(atob(receipt.status["SuccessValue"]));
     console.log("new Registry data::", { ...data }, receiverId);
 
     if (data.admins) {
       for (const admin in data.admins) {
-        await context.db.Account.upsert({ id: admin }, ["id"], []);
+        await context.db.Account.upsert({ id: data.admins[admin] }, ["id"], []);
         let list_admin = {
-          list_id: receiverId,
+          list_id: data.id,
           admin_id: admin,
         };
         await context.db.ListAdmin.insert(list_admin);
@@ -218,11 +217,16 @@ async function getBlock(block: Block) {
     }
 
     let regv = {
-      id: receiverId,
+      id: data.id,
       owner_id: data.owner,
-      default_registration_status: "Approved", // the first registry contract has approved as default, and the later changed through the admin set function call, which we also listen to, so it should self correct.
-      name: receiverId.split(".")[0],
+      default_registration_status: data.default_registration_status, // the first registry contract has approved as default, and the later changed through the admin set function call, which we also listen to, so it should self correct.
+      name: data.name,
+      description: data.description,
+      cover_image_url: data.cover_image_url,
+      admin_only_registrations: data.admin_only_registrations,
       tx_hash: receiptId,
+      created_at: data.created_at,
+      updated_at: data.updated_at
     };
 
 
@@ -235,27 +239,37 @@ async function getBlock(block: Block) {
   async function handleNewProject(args, receiverId, signerId, receiptId) {
     let data = JSON.parse(args);
     console.log("new Project data::", { ...data }, receiverId);
-    let registry = (await context.db.List.select({ id: receiverId }))[0]; // fetch the registry so as to get default
-    let reg = {
-      registrant_id: data._project_id || signerId,
-      status: registry.default_registration_status,
-      submitted_at: new Date(
-        Number(BigInt(block.header().timestampNanosec) / BigInt(1000000))
-      ),
-    };
-    if (data._project_id) {
-      await context.db.Account.upsert({ id: data._project_id }, ["id"], []);
-    }
-
+    let receipt = block
+      .receipts()
+      .filter((receipt) => receipt.receiptId == receiptId)[0];
+    let reg_data = JSON.parse(atob(receipt.status["SuccessValue"]));
+    // let array_data = Array.isArray(reg_data) ? reg_data : [reg_data]
+    let project_list = []
+    let insert_data = reg_data.map((dt) => {
+      project_list.push({id: dt.registrant_id});
+      return {
+        id: dt.id,
+        registrant_id: dt.registrant_id,
+        list_id: dt.list_id,
+        status: dt.status,
+        submitted_at: dt.submitted_ms,
+        updated_at: dt.updated_ms,
+        registered_by: dt.registered_by,
+        admin_notes: dt.admin_notes,
+        registrant_notes: dt.registrant_notes,
+        tx_hash: receiptId
+      };
+    })
+    await context.db.Account.upsert(project_list, ["id"], []);
     await context.db.Account.upsert({ id: signerId }, ["id"], []);
 
-    await context.db.ListRegistration.insert(reg);
+    await context.db.ListRegistration.insert(insert_data);
     let activity = {
       signer_id: signerId,
       receiver_id: receiverId,
-      timestamp: reg.submitted_at,
-      type: "Register",
-      action_result: reg.registrant_id,
+      timestamp: insert_data[0].submitted_at,
+      type: "Register_Batch",
+      action_result: JSON.stringify(reg_data),
       tx_hash: receiptId,
     };
 
@@ -273,9 +287,7 @@ async function getBlock(block: Block) {
     let regUpdate = {
       status: data.status,
       admin_notes: data.review_notes,
-      updated_at: new Date(
-        Number(BigInt(block.header().timestampNanosec) / BigInt(1000000))
-      ),
+      updated_at: created_at,
     };
 
     await context.db.ListRegistration.update(
@@ -286,24 +298,28 @@ async function getBlock(block: Block) {
 
   async function handlePotApplication(args, receiverId, signerId, receiptId) {
     let data = JSON.parse(args);
-    console.log("new factory data::", { ...data }, receiverId);
+    let receipt = block
+      .receipts()
+      .filter((receipt) => receipt.receiptId == receiptId)[0];
+    let appl_data = JSON.parse(atob(receipt.status["SuccessValue"]));
+    console.log("new pot application data::", { ...data }, receiverId);
     await context.db.Account.upsert({ id: data.project_id }, ["id"], []);
     let application = {
       pot_id: receiverId,
-      applicant_id: data.project_id,
-      message: data.message,
-      submitted_at: data.submitted_at,
-      current_status: data.status,
+      applicant_id: appl_data.project_id,
+      message: appl_data.message,
+      submitted_at: appl_data.submitted_at,
+      status: appl_data.status,
       tx_hash: receiptId,
     };
-    const appl = await context.db.PotApplication.insert(application);
+    await context.db.PotApplication.insert(application);
 
     let activity = {
       signer_id: signerId,
       receiver_id: receiverId,
       timestamp: application.submitted_at,
       type: "Submit_Application",
-      action_result: appl[0].id.toString(), // result points to the pot application created.
+      action_result: JSON.stringify(appl_data), // result points to the pot application created.
       tx_hash: receiptId, // should we have receipt on both action and activity?
     };
 
@@ -317,7 +333,7 @@ async function getBlock(block: Block) {
     receiptId
   ) {
     let data = JSON.parse(args);
-    console.log("new factory data::", { ...data }, receiverId);
+    console.log("pot application update data::", { ...data }, receiverId);
 
     let receipt = block
       .receipts()
@@ -333,6 +349,7 @@ async function getBlock(block: Block) {
       notes: update_data.notes,
       status: update_data.status,
       reviewed_at: update_data.updated_at,
+      tx_hash: receiptId
     };
     let applicationUpdate = {
       current_status: update_data.status,
@@ -356,7 +373,35 @@ async function getBlock(block: Block) {
       default_registration_status: data.status,
     };
 
-    await context.db.List.update({ id: receiverId }, listUpdate);
+    await context.db.List.update({ id: data.list_id || receiverId }, listUpdate);
+  }
+
+  async function handleUpVoting(
+    args,
+    receiverId,
+    signerId,
+    receiptId
+  ) {
+    let data = JSON.parse(args);
+    console.log("upvote list::", { ...data }, receiverId);
+
+    let listUpVote = {
+      list_id: data.list_id,
+      account_id: signerId,
+      created_at
+    };
+
+    let activity = {
+      signer_id: signerId,
+      receiver_id: receiverId,
+      timestamp: created_at,
+      type: "Upvote",
+      action_result: JSON.stringify(data),
+      tx_hash: receiptId,
+    };
+
+    await context.db.List.update({ id: data.list_id || receiverId }, listUpVote);
+    await context.db.Activity.insert(activity);
   }
 
   async function handleSettingPayout(args, receiverId, signerId, receiptId) {
@@ -368,7 +413,7 @@ async function getBlock(block: Block) {
       let potPayout = {
         recipient_id: payout["project_id"],
         amount: payout["amount"],
-        ft_id: payout["ft_id"] || null,
+        ft_id: payout["ft_id"] || "near",
         tx_hash: receiptId,
       };
       await context.db.PotPayout.insert(potPayout);
@@ -377,11 +422,12 @@ async function getBlock(block: Block) {
 
   async function handlePayout(args, receiverId, signerId, receiptId) {
     let data = JSON.parse(args);
+    data = data.payout
     console.log("fulfill payout data::", { ...data }, receiverId);
     let payout = {
       recipient_id: data.project_id,
       amount: data.amount,
-      paid_at: data.paid_at,
+      paid_at: data.paid_at || created_at,
       tx_hash: receiptId,
     };
     await context.db.PotPayout.update({ recipient_id: data.project_id }, payout);
@@ -407,7 +453,7 @@ async function getBlock(block: Block) {
       receiver_id: receiverId,
       timestamp: created_at,
       type: "Challenge_Payout",
-      action_result: receiverId,
+      action_result: JSON.stringify(payoutChallenge),
       tx_hash: receiptId,
     };
 
@@ -417,19 +463,16 @@ async function getBlock(block: Block) {
   async function handleListAdminRemoval(args, receiverId, signerId, receiptId) {
     let data = JSON.parse(args);
     console.log("removing admin...: ", { ...data }, receiverId);
-    let ts = new Date(
-      Number(BigInt(block.header().timestampNanosec) / BigInt(1000000)) // convert to ms then date
-    )
-    let list = await context.db.List.select({id: receiverId})
+    let list = await context.db.List.select({ id: receiverId })
 
     for (const acct in data.admins) {
-      await context.db.ListAdmin.delete({ list_id: list[0].id, admin_id: acct})
+      await context.db.ListAdmin.delete({ list_id: list[0].id, admin_id: acct })
     }
 
     let activity = {
       signer_id: signerId,
       receiver_id: receiverId,
-      timestamp: ts,
+      timestamp: created_at,
       type: "Remove_List_Admin",
       tx_hash: receiptId,
     };
@@ -459,47 +502,64 @@ async function getBlock(block: Block) {
     actionName,
     receiptId
   ) {
-    let matching_pool = JSON.parse(args).matching_pool
-    if ((actionName == "donate" && receiverId != "donate.potlock.near") || matching_pool) {
+    let donation_data;
+    if ((actionName == "direct")) {
       console.log("calling donate on projects...");
-      return;
+      let event = block.events().filter((evt) => evt.relatedReceiptId == receiptId)
+      if (!event.length) { return }
+      const event_data = event[0].rawEvent.standard
+      console.log("pioper..", event_data)
+      donation_data = JSON.parse(event_data).data[0].donation
+      console.log("DODONDAWA..", donation_data)
+    } else {
+      let receipt = block
+        .receipts()
+        .filter((receipt) => receipt.receiptId == receiptId)[0];
+      donation_data = JSON.parse(atob(receipt.status["SuccessValue"]));
     }
     console.log("action and recv", actionName, receiverId);
-    let receipt = block
-      .receipts()
-      .filter((receipt) => receipt.receiptId == receiptId)[0];
-    let donation_data = JSON.parse(atob(receipt.status["SuccessValue"]));
+
     console.log("result arg...:", donation_data);
     let donated_at = new Date(donation_data.donated_at || donation_data.donated_at_ms);
     await context.db.Account.upsert({ id: donation_data.donor_id }, ["id"], []);
-    let endpoint = `${GECKO_URL}/coins/${
-      donation_data.ft_id || "near"
-    }/history?date=${formatDate(donated_at)}&localization=false`;
-    let response = await fetch(endpoint);
-    let data = await response.json();
-    let unit_price = data.market_data?.current_price.usd;
-    if (!unit_price) {
-      console.log("api rate limi?::", data)
-      unit_price = parseFloat(localStorage.getItem("last_price"))
+    let endpoint = `${GECKO_URL}/coins/${donation_data.ft_id || "near"
+      }/history?date=${formatDate(donated_at)}&localization=false`;
+    let unit_price;
+    try {
+      let response = await fetch(endpoint);
+      let data = await response.json();
+      unit_price = data.market_data?.current_price.usd;
+      let hist_data = {
+        token_id: donation_data.ft_id || "near",
+        last_updated: created_at,
+        historical_price: unit_price
+      }
+      await context.db.TokenHistoricalData.upsert(hist_data, ["token_id"], ["historical_price"])
+    } catch (err) {
+      console.log("api rate limi?::", err)
+      let historica_price = await context.db.TokenHistoricalData.select({ token_id: donation_data.ft_id || "near" })
+      unit_price = historica_price[0].historical_price
     }
-    localStorage.setItem("last_price", unit_price.toString()) // store last price incase subsequent price fetch fails,  does it support local storage?
 
     let total_amount = donation_data.total_amount;
-    let net_amount = (
-      BigInt(donation_data.total_amount) - BigInt(donation_data.protocol_fee)
-    ).toString();
+    let net_amount = donation_data.net_amount
+    if (donation_data.referrer_fee) {
+      net_amount = (
+        BigInt(net_amount) - BigInt(donation_data.referrer_fee)
+      ).toString();
+    }
 
-    let totalnearAMount = formatToNear(total_amount);
-    let netnearAMount = formatToNear(net_amount);
-    let total_amount_usd = unit_price * totalnearAMount
-    let net_amount_usd = unit_price * netnearAMount
+    let totalnearAmount = formatToNear(total_amount);
+    let netnearAmount = formatToNear(net_amount);
+    let total_amount_usd = unit_price * totalnearAmount
+    let net_amount_usd = unit_price * netnearAmount
     let donation = {
       donor_id: donation_data.donor_id,
       total_amount,
       total_amount_usd,
       net_amount_usd,
       net_amount,
-      ft_id: donation_data.ft_id || null,
+      ft_id: donation_data.ft_id || "near",
       message: donation_data.message,
       donated_at,
       matching_pool: donation_data.matching_pool || false,
@@ -511,8 +571,8 @@ async function getBlock(block: Block) {
     };
     await context.db.Donation.insert(donation);
 
-    if (actionName != "donate") { // update pot data such as public donations and matchingpool
-      let pot = (await context.db.Pot.select({ id: receiverId}))[0]
+    if (actionName != "direct") { // update pot data such as public donations and matchingpool
+      let pot = (await context.db.Pot.select({ id: receiverId }))[0]
       donation["pot_id"] = pot.id
       let potUpdate = {
         total_public_donations_usd: pot.total_public_donations_usd || 0 + total_amount_usd,
@@ -528,7 +588,7 @@ async function getBlock(block: Block) {
       } else {
         potUpdate["public_donations_count"] = pot.public_donations_count || 0 + 1
       }
-      await context.db.Pot.update({id: pot.id}, potUpdate)
+      await context.db.Pot.update({ id: pot.id }, potUpdate)
     }
 
     let recipient = donation_data.project_id || donation_data.recipient_id
@@ -537,7 +597,7 @@ async function getBlock(block: Block) {
       let acct = (await context.db.Account.select({ id: recipient }))[0]
       console.log("selected acct", acct)
       let acctUpdate = {
-        total_donations_usd: acct.total_donations_usd || 0 + total_amount_usd,
+        total_donations_usd: acct.total_donations_received_usd || 0 + total_amount_usd,
         donors_count: acct.donors_count || 0 + 1
       }
       await context.db.Account.update({ id: recipient }, acctUpdate)
@@ -548,12 +608,12 @@ async function getBlock(block: Block) {
       receiver_id: receiverId,
       timestamp: donation.donated_at,
       type:
-        actionName == "donate"
+        actionName == "direct"
           ? "Donate_Direct"
           : donation.matching_pool
-          ? "Donate_Pot_Matching_Pool"
+            ? "Donate_Pot_Matching_Pool"
             : "Donate_Pot_Public",
-      action_result: recipient,
+      action_result: JSON.stringify(donation),
       tx_hash: receiptId,
     };
 
@@ -570,28 +630,21 @@ async function getBlock(block: Block) {
           const args = atob(call.args); // decode function call argument
           switch (call.methodName) {
             case "new":
-            // new can be called on  a couple of things, if the recever id matches factory pattern, then it's a new factory, else if it matches the registry account id, then it's a registry contract initialization, else, it's a new pot initialization.
+              // new can be called on  a couple of things, if the recever id matches factory pattern, then it's a new factory, else if it matches the registry account id, then it's a registry contract initialization, else, it's a new pot initialization.
               matchVersionPattern(action.receiverId)
                 ? await handleNewFactory(
-                    args,
-                    action.receiverId,
-                    action.signerId,
-                    action.receiptId
-                  )
-                : action.receiverId == "registry.potlock.near" // initializing registry
-                ? await handleRegistry(
-                    args,
-                    action.receiverId,
-                    action.signerId,
-                    action.receiptId
-                  )
+                  args,
+                  action.receiverId,
+                  action.signerId,
+                  action.receiptId
+                )
                 : await handleNewPot(
-                    args,
-                    action.receiverId,
-                    action.signerId,
-                    action.predecessorId,
-                    action.receiptId
-                  );
+                  args,
+                  action.receiverId,
+                  action.signerId,
+                  action.predecessorId,
+                  action.receiptId
+                );
               break;
             // this is the callback after user applies to a certain pot, it can either be this or handle_apply
             case "assert_can_apply_callback":
@@ -606,7 +659,7 @@ async function getBlock(block: Block) {
             case "handle_apply":
               console.log("application case 2:", JSON.parse(args));
               break;
-            
+
             // if function call is donate, call the handle new donations function
             case "donate":
               console.log("donatons to project incoming:", JSON.parse(args));
@@ -614,11 +667,11 @@ async function getBlock(block: Block) {
                 args,
                 action.receiverId,
                 action.signerId,
-                "donate",
+                "direct",
                 action.receiptId
               );
               break;
-            
+
             // this is a form of donation where user calls donate on a pot
             case "handle_protocol_fee_callback":
               console.log("donations to pool incoming:", JSON.parse(args));
@@ -626,12 +679,12 @@ async function getBlock(block: Block) {
                 args,
                 action.receiverId,
                 action.signerId,
-                "handle_protocol_fee_callback",
+                "pot",
                 action.receiptId
               );
               break;
             // this handles project/list registration
-            case "register":
+            case "register_batch":
               console.log("registrations incoming:", JSON.parse(args));
               await handleNewProject(
                 args,
@@ -640,7 +693,7 @@ async function getBlock(block: Block) {
                 action.receiptId
               );
               break;
-            
+
             // chefs approve/decline ... etc a projects application to a pot
             case "chef_set_application_status":
               console.log(
@@ -654,7 +707,7 @@ async function getBlock(block: Block) {
                 action.receiptId
               );
               break;
-            
+
             // registries can have default status for projects
             case "admin_set_default_project_status":
               console.log(
@@ -668,7 +721,7 @@ async function getBlock(block: Block) {
                 action.receiptId
               );
               break;
-            
+
             // admins can set a project's status
             case "admin_set_project_status":
               console.log(
@@ -682,11 +735,11 @@ async function getBlock(block: Block) {
                 action.receiptId
               );
               break;
-            
+
             // fires when chef set payouts
             case "chef_set_payouts":
               console.log(
-                "setting payot....:",
+                "setting payout....:",
                 JSON.parse(args)
               );
               await handleSettingPayout(
@@ -696,7 +749,7 @@ async function getBlock(block: Block) {
                 action.receiptId
               );
               break;
-            
+
             // fires when there is a payout challenge
             case "challenge_payouts":
               console.log(
@@ -725,7 +778,7 @@ async function getBlock(block: Block) {
               break;
             case "owner_remove_admins":
               console.log(
-                "setting payot....:",
+                "attempting to remove admins....:",
                 JSON.parse(args)
               );
               await handleListAdminRemoval(
@@ -735,6 +788,24 @@ async function getBlock(block: Block) {
                 action.receiptId
               );
               break;
+            case "create_list":
+              console.log("creating list...", JSON.parse(args))
+              await handleRegistry(
+                args,
+                action.receiverId,
+                action.signerId,
+                action.receiptId
+              );
+              break;
+            case "upvote":
+              console.log("up voting...", JSON.parse(args))
+              await handleUpVoting(
+                args,
+                action.receiverId,
+                action.signerId,
+                action.receiptId
+              )
+
           }
         }
       });
